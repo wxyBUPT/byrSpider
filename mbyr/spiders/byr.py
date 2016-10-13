@@ -5,7 +5,7 @@ import logging
 import logging.config
 from datetime import datetime
 
-logging.config.fileConfig('./logger.ini')
+#logging.config.fileConfig('./logger.ini')
 import scrapy
 from scrapy.http import FormRequest,Request
 
@@ -108,13 +108,14 @@ class ByrSpider(scrapy.Spider):
                 'vote':vote
             })
 
-    def handle_li(self,li):
+    def handle_li(self,li,isfirst):
         '''
         处理有内容的li标签
         可能需要处理图片与br 标签
         handle li tag
         tag contains username,posttime content user ip
-        :param li:
+        :param li:要处理的标签
+        :param isfirst 是否是第一条信息
         :return:
         '''
         headers = li.xpath('div/div')[0].xpath('a')
@@ -127,20 +128,22 @@ class ByrSpider(scrapy.Spider):
         目前使用第一种策略
         第二种策略的代码同样也如下实现
         '''
-        div = li.css('.sp')
-        content = div.extract()
-        #lines = li.css('.sp').xpath('text()').extract()
-        #content = u'\n'.join(lines)
-        imgs = div.xpath('img')
         imgItems = []
-        for img in imgs:
-            imageItem = ImageItem()
-            imageItem['href'] = img.xpath('@src').extract()[0]
-            imageItem['done'] = False
-            imgItems.append(imageItem)
+        div = li.css('.sp')
+        if isfirst:
+            content = div.extract()
+            imgs = div.xpath('img')
+            for img in imgs:
+                imageItem = ImageItem()
+                imageItem['href'] = img.xpath('@src').extract()[0]
+                imageItem['done'] = False
+                imgItems.append(imageItem)
+        else:
+            lines = div.xpath('text()').extract()
+            content = u'\n'.join(lines)
+
         #暂时先不处理图片
         return (username,posttime,content,imgItems)
-
 
     def parseTop(self,response):
         '''
@@ -148,32 +151,106 @@ class ByrSpider(scrapy.Spider):
         :param response:
         :return:
         '''
-
-        #获得总共多少页，与当前页
+        stats = self.stats
         pageInfo = response.css('.plant')[-2].xpath('text()').extract()[0]
         (currPage,totalPage) = map(lambda x:int(x),pageInfo.split(u'/'))
-        print currPage, totalPage
-        from scrapy.shell import inspect_response
-        inspect_response(response,self)
-
-        contents = response.css(".list")
-        if len(contents) != 1:
-            self.logger.error(u".list 并不是唯一的选择器，页面结构可能被改变")
-            print len(contents)
-
-        contents = contents[0].xpath('li')
-        username,posttime,content,imgItems = self.handle_li(contents[1])
-        #不管怎样先yield
-        for imgItem in imgItems:
-            yield imgItem
-
         fullPostItem = FullPostItem()
         fullPostItem['name'] = response.meta['title']
-        fullPostItem['time'] = posttime
-        fullPostItem['user'] = username
-        fullPostItem['content'] = content
-        fullPostItem['comments'] = [self.handle_li(li) for index,li in enumerate(contents) if index not in (0,2)]
+        fullPostItem['type'] = 'top10'
+        fullPostItem['url'] = response.url
+        # 有热门评论的页面和没有热门评论的页面结构不一样，做如下区分，为了不让函数过多，所以两种情况都写在一个函数内
+        hlb = response.css('.hlb')
+        if len(hlb) != 0:
+            # 有热门评论的页面
+            stats.inc_value("top_ten_with_hot", 1, 0)
+            # 首先处理热门评论和十大内容
+            contents = response.css('.list')[0]
+            # 获得十大相关内容
+            li = contents.xpath('li')[1]
+            username,posttime,content,imgItems = self.handle_li(li,True)
+            for imgItem in imgItems:
+                yield imgItem
+            fullPostItem['time'] = posttime
+            fullPostItem['user'] = username
+            fullPostItem['content'] = content
+            hots = []
+            # 十大内容已经获得,接下来获得所有的热门评论
+            div = contents.xpath('div')[1]
+            li = div.xpath('li')
+            tmp = {}
+            tmp['user'] = li.xpath('div/a')[1].xpath('text()').extract()[0]
+            tmp['vote'] = int(li.xpath('div/span/text()').extract()[0][2:-1])
+            tmp['say'] = '\n'.join(li.xpath('div/text()').extract())
+            hots.append(tmp)
+            lis = div.css('#nicec').xpath('li')
+            for item in lis:
+                tmp = {}
+                div = item.xpath('div')
+                tmp['user'] = div[0].xpath('a')[1].xpath('text()').extract()[0]
+                tmp['vote'] = int(div[0].xpath('span/text()').extract()[0][2:-1])
+                tmp['say'] = '\n'.join(div[1].xpath('text()').extract())
+                hots.append(tmp)
+            fullPostItem['hots'] = hots
+            lis = response.css('#m_main').xpath('li')
+            fullPostItem['comments'] = [self.handle_li(li,False)[:-1] for index,li in enumerate(lis) if index not in (0,)]
 
+            #from scrapy.shell import inspect_response
+            #inspect_response(response,self)
+            pass
+        else:
+            # 没有热门评论的页面
+            stats.inc_value("top_ten_without_hot", 1, 0)
+            contents = response.css('.list')
+            if len(contents) != 0:
+                self.logger.error(u".list 不是没有热门评论的选择器，结构可能被改变了")
+                stats.inc_value('xpath_error',1,0)
+            comments = contents[0].xpath('li')
+            username,posttime,content,imgItems = self.handle_li(comments[1],True)
+            #不管怎么样想yield
+            for imgItem in imgItems:
+                yield imgItem
+            fullPostItem['time'] = posttime
+            fullPostItem['user'] = username
+            fullPostItem['content'] = content
+            fullPostItem['comments'] = [
+                self.handle_li(li,False)[:-1] for index,li in enumerate(comments) if index not in (0,1,2)
+            ]
+            #from scrapy.shell import inspect_response
+            #inspect_response(response,self)
+        # 如果还有下一页，则处理下一页内容
+        if currPage < totalPage:
+            yield Request(response.url + '?p=2', callback=self.parsnextpage,headers=self.headers,meta={
+                'cookiejar':response.meta['cookiejar'],
+                'fullpostitem' : fullPostItem,
+                'currpage':2,
+                'totalpage':totalPage
+            })
+
+
+    def parsnextpage(self,response):
+        '''
+        因为一个帖子不可能只有一页，所以用来处理接下来的页面
+        :param response:
+        :return:
+        '''
+        stats = self.stats
+        fullpostitem = response.meta['fullpostitem']
+        currpage = response.meta['currpage']
+        totalpage = response.meta['totalpage']
+        stats.inc_value("page%s"%currpage, 1, 0)
+        lis = response.css('.list')[0].xpath('li')
+        fullpostitem['comments'] = fullpostitem['comments'] + [
+            self.handle_li(li, False)[:-1] for index, li in enumerate(lis) if index not in (0, 2)
+        ]
+        if currpage < totalpage:
+            yield Request(response.url.split('?')[0] + '?p=%d'%(currpage+1), callback=self.parsnextpage,headers=self.headers,meta={
+                'cookiejar':response.meta['cookiejar'],
+                'fullpostitem' : fullpostitem,
+                'currpage':currpage+1,
+                'totalpage':totalpage
+            })
+        else:
+            yield fullpostitem
         pass
 
     def parse(self, response):
@@ -217,7 +294,7 @@ class DirNode:
         Consuturct
         :param name: ex. 笑口常开
         :param isLeaf: Is leaf node
-        :param url: url, ex. /board/Joke
+        :param href: href, ex. /board/Joke
         :return:
         '''
         self.name = name
@@ -241,3 +318,40 @@ class DirNode:
         '''
         return self.name + u"isLeaf: " + self.isLeaf + u", fullUrl: " + self.fullUrl
 
+
+def handle_li(li,isfirst):
+    '''
+    处理有内容的li标签
+    可能需要处理图片与br 标签
+    handle li tag
+    tag contains username,posttime content user ip
+    :param li:要处理的标签
+    :param isfirst 是否是第一条信息
+    :return:
+    '''
+    headers = li.xpath('div/div')[0].xpath('a')
+    username = headers[1].xpath('text()').extract()[0]
+    timestr = headers[2].xpath('text()').extract()[0]
+    posttime = datetime.strptime(timestr,'%Y-%m-%d %H:%M:%S')
+    '''
+    打算使用两种策略，一种是直接保存html,这样的好处是可以保持原来的格式
+    另外一种策略是保存文本，好处是存储空间小，但是格式不美观
+    目前使用第一种策略
+    第二种策略的代码同样也如下实现
+    '''
+    imgItems = []
+    div = li.css('.sp')
+    if isfirst:
+        content = div.extract()
+        imgs = div.xpath('img')
+        for img in imgs:
+            imageItem = ImageItem()
+            imageItem['href'] = img.xpath('@src').extract()[0]
+            imageItem['done'] = False
+            imgItems.append(imageItem)
+    else:
+        lines = div.xpath('text()').extract()
+        content = u'\n'.join(lines)
+
+    #暂时先不处理图片
+    return (username,posttime,content,imgItems)

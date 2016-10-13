@@ -61,7 +61,7 @@ DOWNLOADER_MIDDLEWARES = {
 
 #COOKIES_DEBUG = True
 
-#LOG_LEVEL = logging.INFO
+LOG_LEVEL = logging.DEBUG
 
 # Enable or disable extensions
 # See http://scrapy.readthedocs.org/en/latest/topics/extensions.html
