@@ -161,7 +161,6 @@ class ByrSpider(scrapy.Spider):
             self.logger.error(u".list 并不是唯一的选择器，页面结构可能被改变")
             print len(contents)
 
-        '''
         contents = contents[0].xpath('li')
         username,posttime,content,imgItems = self.handle_li(contents[1])
         #不管怎样先yield
@@ -174,7 +173,6 @@ class ByrSpider(scrapy.Spider):
         fullPostItem['user'] = username
         fullPostItem['content'] = content
         fullPostItem['comments'] = [self.handle_li(li) for index,li in enumerate(contents) if index not in (0,2)]
-        '''
 
         pass
 
