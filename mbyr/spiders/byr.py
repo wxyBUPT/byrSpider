@@ -10,6 +10,8 @@ import scrapy
 from scrapy.http import FormRequest,Request
 
 from mbyr.items import FullPostItem,ImageItem
+from mbyr.conf import ConfUtil
+from mbyr.reduceRepetition import RepReducer
 
 class ByrSpider(scrapy.Spider):
 
@@ -30,6 +32,8 @@ class ByrSpider(scrapy.Spider):
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/38.0.2125.111 Safari/537.36",
         "HOST":'m.byr.cn'
     }
+
+    repReducer = RepReducer()
 
     def __init__(self,stats,*args,**kwargs):
         super(ByrSpider,self).__init__(*args,**kwargs)
@@ -54,9 +58,9 @@ class ByrSpider(scrapy.Spider):
                 'cookiejar':response.meta['cookiejar']
             },
             formdata={
-                "id":"qwe1234",
-                "passwd":"1402216786"
-            },callback = self.afterLogin,
+                "id":ConfUtil.get_byr_account(),
+                "passwd":ConfUtil.get_byr_pass(),
+            }, callback = self.afterLogin,
         )
         return request
 
@@ -68,8 +72,6 @@ class ByrSpider(scrapy.Spider):
         :return:
         '''
         logger = self.logger
-        logger.info(u"日志是有效的")
-        print(u'处理十大')
         yield Request("http://m.byr.cn",callback=self.parseTopTen,headers=self.headers,meta={
             'cookiejar':response.meta['cookiejar'],
         },dont_filter=True)
@@ -107,6 +109,9 @@ class ByrSpider(scrapy.Spider):
                 'i':idx,
                 'vote':vote
             })
+    def inspect(self, response):
+        from scrapy.shell import inspect_response
+        inspect_response(response,self)
 
     def handle_li(self,li,isfirst):
         '''
@@ -251,7 +256,6 @@ class ByrSpider(scrapy.Spider):
             })
         else:
             yield fullpostitem
-        pass
 
     def parse(self, response):
         pass
@@ -262,6 +266,7 @@ class ByrSpider(scrapy.Spider):
         #inspect_response(response,self)
 
         parent = response.meta['dirParent']
+        stats = self.stats
 
         for node in nodes:
             try:
@@ -274,7 +279,8 @@ class ByrSpider(scrapy.Spider):
             name = node.xpath("a")[0].xpath('text()').extract()[0]
             href = node.xpath("a")[0].xpath('@href').extract()[0]
             if(type.startswith(u"目录")):
-                tmpnode = DirNode(name,False,href)
+                stats.inc_value("dir_count", 1, 0)
+                tmpnode = DirNode(name, False, href)
                 parent.appendChild(tmpnode)
                 yield Request(tmpnode.fullUrl,callback=self.getDirTree,headers=self.headers,meta={
                     'cookiejar':response.meta['cookiejar'],
@@ -283,9 +289,89 @@ class ByrSpider(scrapy.Spider):
             if(type.startswith(u"版面")):
                 tmpnode = DirNode(name,True,href)
                 parent.appendChild(tmpnode)
-                #print(name)
-                #print(href)
-                #开始处理版面
+                stats.inc_value("board_count",1,0)
+                # print(name)
+                # print(href)
+                # 开始处理版面
+                # 十大信息已经全部处理完毕
+                yield Request(
+                    tmpnode.fullUrl, callback=self.parse_board, headers=self.headers, meta={
+                        'cookiejar': response.meta['cookiejar'],
+                        'name':name,
+                        'type':href.split('/')[2]
+                    }
+                )
+
+    def parse_board(self, response):
+        '''
+        处理board 的入口
+        :param response:
+        :return:
+        '''
+        stats = self.stats
+        stype = response.meta['type']
+        name = response.meta['name']
+        # 增加board_1 计数
+        stats.inc_value("board_1", 1, 0)
+        # 增加获得类别页面数目的计数
+        stats.inc_value("%s_board"%stype, 1, 0)
+        ul = response.css('.list')
+        lis = ul.xpath('li')
+        # 记录board 当前是否已经完成遍历
+        finished = False
+        for li in lis:
+            divs = li.xpath('div')
+            top_div_a = divs[0].xpath('a')
+            top_class = top_div_a.xpath('@class').extract()
+            if len(top_class) and top_class[0] == 'top':
+                # 热门帖子，处理热门
+                top_url_hash = top_div_a.xpath('@href').extract()[0].split("/")[-1]
+                if not self.repReducer.is_top_visited(name_space=stype, top_url_hash=top_url_hash):
+                    stats.inc_value("unparse_top", 1, 0)
+                    print u'热门帖子未被处理，但是我并不想处理，欢迎添加'
+                    self.repReducer.visit_top(stype, top_url_hash)
+            else:
+                url_hash = top_div_a.xpath('@href').extract()[0].split("/")[-1]
+                curr_index = int(divs[0].xpath('text()').extract()[0].rstrip(")").lstrip("("))
+                last_crawl_index = self.repReducer.get_post_last_visit_index(name_space=stype,url_hash=url_hash)
+                if last_crawl_index == curr_index:
+                    finished = True
+                    break
+                else:
+                    # 开始处理有未被爬取的帖子，有两类帖子，一类是完全没有被爬取的，另外一类是需要增量添加的帖子
+                    if last_crawl_index == -1:
+                        # 处理完全没有被爬取的帖子，和十大帖子处理逻辑一样
+                        post_name = top_div_a.xpath("text()").extract()[0]
+                        href = top_div_a.xpath("@href").extract()[0]
+                        full_url = "http://m.byr.cn" + href
+                        # 处理帖子的第一页
+                        yield Request(
+                            full_url, callback=self.parse_post_first_page, headers=self.headers,
+                            meta={
+                                'cookiejar':response.meta['cookiejar'],
+                                'title':post_name,
+                                'stype':stype,
+                                'full_url':full_url
+                            }
+                        )
+                        pass
+                    else:
+                        print u'需要处理部分内容被爬取的帖子'
+                        pass
+
+                    pass
+                # 设置最先爬取到的位置
+                self.repReducer.set_post_visit_index(name_space=stype,url_hash=url_hash,index=curr_index)
+
+        if not finished:
+            print u'页面遍历并未完成，访问下一页'
+
+        pass
+
+    def parse_post_first_page(self,response):
+        print u'处理没有被爬取到的帖子'
+        self.inspect(response)
+        pass
 
 class DirNode:
 
@@ -329,6 +415,8 @@ def handle_li(li,isfirst):
     :param isfirst 是否是第一条信息
     :return:
     '''
+    from datetime import datetime
+    from mbyr.items import ImageItem
     headers = li.xpath('div/div')[0].xpath('a')
     username = headers[1].xpath('text()').extract()[0]
     timestr = headers[2].xpath('text()').extract()[0]
