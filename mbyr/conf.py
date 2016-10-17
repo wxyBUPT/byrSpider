@@ -27,3 +27,11 @@ class ConfUtil:
     @classmethod
     def get_redis_db(cls):
         return cf.getint("redis", "db")
+
+    @classmethod
+    def get_mongo_uri(cls):
+        return cf.get('mongo','uri')
+
+    @classmethod
+    def get_mongo_db(cls):
+        return cf.get('mongo','db')

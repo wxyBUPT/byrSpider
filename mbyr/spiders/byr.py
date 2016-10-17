@@ -9,7 +9,7 @@ from datetime import datetime
 import scrapy
 from scrapy.http import FormRequest,Request
 
-from mbyr.items import FullPostItem,ImageItem
+from mbyr.items import FullPostItem,ImageItem, NewPostInfo
 from mbyr.conf import ConfUtil
 from mbyr.reduceRepetition import RepReducer
 
@@ -142,6 +142,7 @@ class ByrSpider(scrapy.Spider):
                 imageItem = ImageItem()
                 imageItem['href'] = img.xpath('@src').extract()[0]
                 imageItem['done'] = False
+                imageItem['type'] = 'img'
                 imgItems.append(imageItem)
         else:
             lines = div.xpath('text()').extract()
@@ -230,6 +231,9 @@ class ByrSpider(scrapy.Spider):
                 'currpage':2,
                 'totalpage':totalPage
             })
+        else:
+            stats.inc_value('new_succeed_top10',1,0)
+            yield fullPostItem
 
 
     def parsnextpage(self,response):
@@ -255,6 +259,7 @@ class ByrSpider(scrapy.Spider):
                 'totalpage':totalpage
             })
         else:
+            stats.inc_value('new_succeed_top10',1,0)
             yield fullpostitem
 
     def parse(self, response):
@@ -334,13 +339,35 @@ class ByrSpider(scrapy.Spider):
                 url_hash = top_div_a.xpath('@href').extract()[0].split("/")[-1]
                 curr_index = int(divs[0].xpath('text()').extract()[0].rstrip(")").lstrip("("))
                 last_crawl_index = self.repReducer.get_post_last_visit_index(name_space=stype,url_hash=url_hash)
-                if last_crawl_index == curr_index:
+                if last_crawl_index >= curr_index:
                     finished = True
                     break
                 else:
                     # 开始处理有未被爬取的帖子，有两类帖子，一类是完全没有被爬取的，另外一类是需要增量添加的帖子
                     if last_crawl_index == -1:
                         # 处理完全没有被爬取的帖子，和十大帖子处理逻辑一样
+                        post_name = top_div_a.xpath("text()").extract()[0]
+                        href = top_div_a.xpath("@href").extract()[0]
+                        full_url = "http://m.byr.cn" + href
+                        newPostInfo = NewPostInfo()
+                        newPostInfo['type'] = 'new_info'
+                        newPostInfo['board'] = stype
+                        newPostInfo['crawled_time'] = datetime.now()
+                        newPostInfo['full_url'] = full_url
+                        yield newPostInfo
+                        # 处理帖子的第一页
+                        yield Request(
+                            full_url, callback=self.parse_post_first_page, headers=self.headers,
+                            meta={
+                                'cookiejar':response.meta['cookiejar'],
+                                'title':post_name,
+                                'stype':stype,
+                                'full_url':full_url
+                            }
+                        )
+                    else:
+                        # 处理有更新的帖子，目前处理的逻辑和没有被爬取到的帖子一样
+                        # 更新操作交给数据库，和十大帖子处理逻辑一样
                         post_name = top_div_a.xpath("text()").extract()[0]
                         href = top_div_a.xpath("@href").extract()[0]
                         full_url = "http://m.byr.cn" + href
@@ -354,24 +381,137 @@ class ByrSpider(scrapy.Spider):
                                 'full_url':full_url
                             }
                         )
-                        pass
-                    else:
-                        print u'需要处理部分内容被爬取的帖子'
-                        pass
 
-                    pass
                 # 设置最先爬取到的位置
+                # 如果爬虫没有正常退出，可能会永久漏掉数据
                 self.repReducer.set_post_visit_index(name_space=stype,url_hash=url_hash,index=curr_index)
 
         if not finished:
-            print u'页面遍历并未完成，访问下一页'
-
-        pass
+            curr_url = response.url
+            url_info = curr_url.split("?")
+            if len(url_info)>= 2:
+                url_base, url_page = url_info
+                url_page = int(url_page.split('=')[1])
+            else:
+                url_base = url_info[0]
+                url_page = 1
+                pass
+            yield Request(
+                url_base + "p=%s"%(url_page+1),
+                callback=self.parse_board,
+                headers=self.headers,
+                meta={
+                    'cookiejar':response.meta['cookiejar'],
+                    'name':name,
+                    'type':url_base.split('/')[2]
+                }
+            )
 
     def parse_post_first_page(self,response):
-        print u'处理没有被爬取到的帖子'
-        self.inspect(response)
-        pass
+        stats = self.stats
+        fullPostItem = FullPostItem()
+        fullPostItem['name'] = response.meta['title']
+        fullPostItem['type'] = 'board'
+        fullPostItem['board'] = response.meta['stype']
+        fullPostItem['url'] = response.url
+        pageInfo = response.css('.plant')[-2].xpath('text()').extract()[0]
+        (currPage,totalPage) = map(lambda x:int(x),pageInfo.split(u'/'))
+        # 有热门评论的页面和没有热门评论的页面结构不一样，做如下区分，为了不让函数过多，所以两种情况都写在一个函数内
+        hlb = response.css('.hlb')
+        if len(hlb) != 0:
+            # 有热门评论的页面
+            stats.inc_value("%s_with_hot"%(fullPostItem['board']), 1, 0)
+            # 首先处理热门评论和十大内容
+            contents = response.css('.list')[0]
+            # 获得十大相关内容
+            li = contents.xpath('li')[1]
+            username,posttime,content,imgItems = self.handle_li(li,True)
+            for imgItem in imgItems:
+                yield imgItem
+            fullPostItem['time'] = posttime
+            fullPostItem['user'] = username
+            fullPostItem['content'] = content
+            hots = []
+            # 十大内容已经获得,接下来获得所有的热门评论
+            div = contents.xpath('div')[1]
+            li = div.xpath('li')
+            tmp = {}
+            tmp['user'] = li.xpath('div/a')[1].xpath('text()').extract()[0]
+            tmp['vote'] = int(li.xpath('div/span/text()').extract()[0][2:-1])
+            tmp['say'] = '\n'.join(li.xpath('div/text()').extract())
+            hots.append(tmp)
+            lis = div.css('#nicec').xpath('li')
+            for item in lis:
+                tmp = {}
+                div = item.xpath('div')
+                tmp['user'] = div[0].xpath('a')[1].xpath('text()').extract()[0]
+                tmp['vote'] = int(div[0].xpath('span/text()').extract()[0][2:-1])
+                tmp['say'] = '\n'.join(div[1].xpath('text()').extract())
+                hots.append(tmp)
+            fullPostItem['hots'] = hots
+            lis = response.css('#m_main').xpath('li')
+            fullPostItem['comments'] = [self.handle_li(li,False)[:-1] for index,li in enumerate(lis) if index not in (0,)]
+
+            #from scrapy.shell import inspect_response
+            #inspect_response(response,self)
+            pass
+        else:
+            # 没有热门评论的页面
+            stats.inc_value("%s_without_hot"%fullPostItem['board'], 1, 0)
+            contents = response.css('.list')
+            if len(contents) != 0:
+                self.logger.error(u".list 不是没有热门评论的选择器，结构可能被改变了")
+                stats.inc_value('xpath_error',1,0)
+            comments = contents[0].xpath('li')
+            username,posttime,content,imgItems = self.handle_li(comments[1],True)
+            #不管怎么样想yield
+            for imgItem in imgItems:
+                yield imgItem
+            fullPostItem['time'] = posttime
+            fullPostItem['user'] = username
+            fullPostItem['content'] = content
+            fullPostItem['comments'] = [
+                self.handle_li(li,False)[:-1] for index,li in enumerate(comments) if index not in (0,1,2)
+            ]
+            #from scrapy.shell import inspect_response
+            #inspect_response(response,self)
+        if currPage < totalPage:
+            yield Request(
+                response.url + '?p=2',callback=self.parse_post_remain,headers=self.headers,
+                meta={
+                    'cookiejar':response.meta['cookiejar'],
+                    'fullpostitem' : fullPostItem,
+                    'currpage':2,
+                    'totalpage':totalPage
+                }
+            )
+        else:
+            stats.inc_value('new_succeed_%s'%fullPostItem['board'],1,0)
+            yield fullPostItem
+
+    def parse_post_remain(self,response):
+        stats = self.stats
+        fullpostitem = response.meta['fullpostitem']
+        currpage = response.meta['currpage']
+        totalpage = response.meta['totalpage']
+        stats.inc_value('page%s'%currpage,1,0)
+        lis = response.css('.list')[0].xpath('li')
+        fullpostitem['comments'] = fullpostitem['comments'] + [
+            self.handle_li(li, False)[:-1] for index, li in enumerate(lis) if index not in (0, 2)
+        ]
+        if currpage < totalpage:
+            yield Request(
+                response.url.split('?')[0] + '?p=%d'%(currpage+ 1),
+                callback=self.parse_post_remain,headers=self.headers,
+                meta={
+                    'cookiejar':response.meta['cookiejar'],
+                    'fullpostitem' : fullpostitem,
+                    'currpage':currpage+1,
+                    'totalpage':totalpage
+                })
+        else:
+            stats.inc_value('new_succeed_%s'%fullpostitem['board'],1,0)
+            yield fullpostitem
 
 class DirNode:
 
@@ -436,6 +576,7 @@ def handle_li(li,isfirst):
             imageItem = ImageItem()
             imageItem['href'] = img.xpath('@src').extract()[0]
             imageItem['done'] = False
+            imageItem['type'] = 'img'
             imgItems.append(imageItem)
     else:
         lines = div.xpath('text()').extract()

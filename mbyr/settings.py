@@ -74,6 +74,10 @@ LOG_LEVEL = logging.DEBUG
 #ITEM_PIPELINES = {
 #    'mbyr.pipelines.SomePipeline': 300,
 #}
+ITEM_PIPLINES = {
+    # item 存储到mongo 中
+    'mbyr.pipelines.SaveToMongo':800,
+}
 
 # Enable and configure the AutoThrottle extension (disabled by default)
 # See http://doc.scrapy.org/en/latest/topics/autothrottle.html
